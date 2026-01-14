@@ -1,0 +1,383 @@
+# -*- coding: utf-8 -*-
+import os
+import cv2
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.feature_selection import SelectKBest, f_classif
+import warnings
+warnings.filterwarnings('ignore')
+
+# 配置
+TRAIN_IMAGE_ROOT = "C:/Users/19429/Desktop/neu-plant-seedling-classification-2025/dataset-for-task1/dataset-for-task1/train"
+TEST_IMAGE_ROOT = "C:/Users/19429/Desktop/neu-plant-seedling-classification-2025/dataset-for-task1/dataset-for-task1/test"
+OUTPUT_CSV = "classification_final_high.csv"
+
+def extract_advanced_features(img_path):
+    """高级特征提取 - 专门针对植物幼苗"""
+    try:
+        img = cv2.imread(img_path)
+        if img is None:
+            return None
+    except:
+        return None
+    
+    # 保持高分辨率
+    img = cv2.resize(img, (256, 256))
+    
+    features = []
+    
+    # ========== 1. 植物专用颜色特征 ==========
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    l_channel = lab[:, :, 0].astype(np.float32)
+    a_channel = lab[:, :, 1].astype(np.float32)  # 绿-红轴
+    b_channel = lab[:, :, 2].astype(np.float32)  # 蓝-黄轴
+    
+    # 多个绿色阈值检测
+    for threshold in [120, 130, 140]:
+        green_mask = a_channel < threshold
+        if np.sum(green_mask) > 100:
+            green_proportion = np.sum(green_mask) / green_mask.size
+            green_l_mean = np.mean(l_channel[green_mask])
+            green_a_mean = np.mean(a_channel[green_mask])
+            features.extend([green_proportion, green_l_mean, green_a_mean])
+        else:
+            features.extend([0, 0, 0])
+    
+    # LAB各通道统计
+    for channel in [l_channel, a_channel, b_channel]:
+        # 基本统计
+        mean_val = np.mean(channel)
+        std_val = np.std(channel)
+        # 四分位距
+        iqr = np.percentile(channel, 75) - np.percentile(channel, 25)
+        # 偏度
+        if std_val > 0:
+            skew = np.mean(((channel - mean_val) / std_val) ** 3)
+        else:
+            skew = 0
+        # 峰度
+        if std_val > 0:
+            kurtosis = np.mean(((channel - mean_val) / std_val) ** 4) - 3
+        else:
+            kurtosis = 0
+        
+        features.extend([mean_val, std_val, iqr, skew, kurtosis])
+    
+    # HSV颜色直方图（更多bins）
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    for i in range(3):
+        hist = cv2.calcHist([hsv], [i], None, [20], [0, 256])  # 20 bins
+        hist = cv2.normalize(hist, hist).flatten()
+        features.extend(hist)
+    
+    # ========== 2. 高级纹理特征 ==========
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # 多尺度梯度特征
+    gradient_features = []
+    for ksize in [3, 5, 7]:
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=ksize)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=ksize)
+        gradient_mag = np.sqrt(sobelx**2 + sobely**2)
+        
+        # 梯度统计
+        gradient_features.extend([
+            np.mean(gradient_mag),
+            np.std(gradient_mag),
+            np.percentile(gradient_mag, 90),
+            np.percentile(gradient_mag, 95),
+            np.percentile(gradient_mag, 99)  # 最强边缘
+        ])
+    
+    features.extend(gradient_features)
+    
+    # Gabor-like特征（模拟）
+    for sigma in [1.0, 2.0]:
+        for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
+            # 简化Gabor滤波
+            kernel_size = 9
+            kernel = cv2.getGaborKernel((kernel_size, kernel_size), sigma, theta, 
+                                       10.0, 0.5, 0, ktype=cv2.CV_32F)
+            filtered = cv2.filter2D(gray.astype(np.float32), -1, kernel)
+            features.extend([np.mean(filtered), np.std(filtered)])
+            break  # 只用一个角度以控制特征数量
+        break
+    
+    # ========== 3. 形状和边缘特征 ==========
+    # 自适应阈值
+    binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY_INV, 11, 2)
+    
+    # 形态学清理
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    shape_features = []
+    if contours:
+        # 取最大轮廓
+        main_cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(main_cnt)
+        perimeter = cv2.arcLength(main_cnt, True)
+        
+        if perimeter > 0:
+            # 紧凑性特征
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            
+            # 边界框特征
+            x, y, w, h = cv2.boundingRect(main_cnt)
+            aspect_ratio = w / (h + 1e-6)
+            extent = area / (w * h + 1e-6)
+            
+            # 凸包特征
+            hull = cv2.convexHull(main_cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+            
+            # 最小外接圆
+            (cx, cy), radius = cv2.minEnclosingCircle(main_cnt)
+            circle_area = np.pi * radius * radius
+            circle_ratio = area / circle_area if circle_area > 0 else 0
+            
+            shape_features = [area, perimeter, circularity, aspect_ratio, 
+                             extent, solidity, circle_ratio]
+        else:
+            shape_features = [0] * 7
+    else:
+        shape_features = [0] * 7
+    
+    features.extend(shape_features)
+    
+    # ========== 4. 统计特征 ==========
+    # 图像熵
+    hist = cv2.calcHist([gray], [0], None, [256], [0, 256])
+    hist = hist / hist.sum()
+    entropy = -np.sum(hist * np.log2(hist + 1e-10))
+    features.append(entropy)
+    
+    # 局部对比度
+    local_std = cv2.blur(gray.astype(np.float32)**2, (5, 5)) - \
+                cv2.blur(gray.astype(np.float32), (5, 5))**2
+    local_std = np.sqrt(np.maximum(local_std, 0))
+    features.extend([np.mean(local_std), np.std(local_std)])
+    
+    # 边缘密度（Canny）
+    edges = cv2.Canny(gray, 30, 100)
+    edge_density = np.sum(edges > 0) / edges.size
+    features.append(edge_density)
+    
+    return np.array(features)
+
+def main():
+    print("🚀 终极植物幼苗分类系统")
+    print("=" * 60)
+    
+    # 1. 提取特征
+    print("\n[1/4] 提取高级特征...")
+    X, y = [], []
+    
+    categories = sorted([d for d in os.listdir(TRAIN_IMAGE_ROOT) 
+                       if os.path.isdir(os.path.join(TRAIN_IMAGE_ROOT, d))])
+    
+    print(f"发现 {len(categories)} 个类别")
+    
+    # 收集所有类别样本
+    for cls in categories:
+        cls_path = os.path.join(TRAIN_IMAGE_ROOT, cls)
+        images = [f for f in os.listdir(cls_path) 
+                 if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        print(f"  {cls}: {len(images)} 张")
+        
+        for img in images:
+            feat = extract_advanced_features(os.path.join(cls_path, img))
+            if feat is not None:
+                X.append(feat)
+                y.append(cls)
+    
+    if not X:
+        print("错误: 没有提取到特征!")
+        return
+    
+    X, y = np.array(X), np.array(y)
+    print(f"\n✅ 特征提取完成: {X.shape[0]} 样本, {X.shape[1]} 特征")
+    
+    # 2. 特征选择（选择最重要的特征）
+    print("\n[2/4] 特征选择...")
+    if X.shape[1] > 100:  # 如果特征太多，进行选择
+        selector = SelectKBest(f_classif, k=min(150, X.shape[1]))
+        X_selected = selector.fit_transform(X, y)
+        print(f"  从 {X.shape[1]} 个特征中选择 {X_selected.shape[1]} 个最佳特征")
+        X = X_selected
+    
+    # 3. 标准化
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # 4. 训练多个模型
+    print("\n[3/4] 训练集成模型...")
+    
+    models = {
+        'RF': RandomForestClassifier(
+            n_estimators=500,
+            max_depth=None,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            max_features='sqrt',
+            bootstrap=True,
+            oob_score=True,
+            random_state=42,
+            n_jobs=-1,
+            class_weight='balanced'
+        ),
+        'SVM': SVC(
+            C=10.0,  # 更大的C，更少正则化
+            kernel='rbf',
+            gamma='scale',
+            probability=True,
+            random_state=42,
+            class_weight='balanced'
+        ),
+        'GBDT': GradientBoostingClassifier(
+            n_estimators=200,
+            learning_rate=0.1,
+            max_depth=5,
+            min_samples_split=10,
+            min_samples_leaf=5,
+            subsample=0.8,
+            random_state=42
+        )
+    }
+    
+    # 交叉验证评估
+    print("  模型评估...")
+    best_model_name = None
+    best_score = 0
+    cv_scores = {}
+    
+    for name, model in models.items():
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        scores = cross_val_score(model, X_scaled, y, cv=cv, scoring='accuracy', n_jobs=-1)
+        mean_score = scores.mean()
+        cv_scores[name] = mean_score
+        
+        print(f"  {name}: {mean_score:.4f} (±{scores.std()*2:.4f})")
+        
+        if mean_score > best_score:
+            best_score = mean_score
+            best_model_name = name
+    
+    print(f"\n  🏆 最佳模型: {best_model_name} ({best_score:.4f})")
+    
+    # 训练最佳模型
+    best_model = models[best_model_name]
+    best_model.fit(X_scaled, y)
+    
+    if hasattr(best_model, 'oob_score_'):
+        print(f"  📊 袋外准确率: {best_model.oob_score_:.4f}")
+    
+    # 5. 预测测试集
+    print(f"\n[4/4] 预测测试集...")
+    
+    test_images = sorted([f for f in os.listdir(TEST_IMAGE_ROOT) 
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    
+    print(f"发现 {len(test_images)} 张测试图片")
+    
+    results = []
+    confidence_scores = []
+    
+    for i, img_name in enumerate(test_images):
+        if (i + 1) % 20 == 0:
+            print(f"  进度: {i+1}/{len(test_images)}")
+        
+        feat = extract_advanced_features(os.path.join(TEST_IMAGE_ROOT, img_name))
+        
+        if feat is not None:
+            # 如果进行了特征选择，需要相应处理
+            if 'selector' in locals():
+                feat = selector.transform([feat])
+            
+            feat_scaled = scaler.transform(feat)
+            
+            # 使用所有模型进行预测并投票
+            predictions = []
+            confidences = []
+            
+            for name, model in models.items():
+                try:
+                    pred = model.predict(feat_scaled)[0]
+                    proba = model.predict_proba(feat_scaled)[0]
+                    conf = np.max(proba)
+                    predictions.append(pred)
+                    confidences.append(conf)
+                except:
+                    continue
+            
+            if predictions:
+                # 投票决定最终预测
+                from collections import Counter
+                final_pred = Counter(predictions).most_common(1)[0][0]
+                avg_confidence = np.mean(confidences) if confidences else 0
+            else:
+                from collections import Counter
+                final_pred = Counter(y).most_common(1)[0][0]
+                avg_confidence = 0
+        else:
+            from collections import Counter
+            final_pred = Counter(y).most_common(1)[0][0]
+            avg_confidence = 0
+        
+        results.append([img_name, final_pred, avg_confidence])
+        confidence_scores.append(avg_confidence)
+    
+    # 6. 保存结果
+    print(f"\n💾 保存结果...")
+    df = pd.DataFrame(results, columns=['ID', 'Category', 'Confidence'])
+    df[['ID', 'Category']].to_csv(OUTPUT_CSV, index=False)
+    
+    if os.path.exists(OUTPUT_CSV):
+        print(f"✅ 结果已保存: {OUTPUT_CSV}")
+        
+        # 详细分析
+        print(f"\n📊 详细分析:")
+        print(f"  总测试图片: {len(df)}")
+        
+        if confidence_scores:
+            print(f"  平均置信度: {np.mean(confidence_scores):.4f}")
+            print(f"  高置信度(≥0.7): {sum(c >= 0.7 for c in confidence_scores)}")
+            print(f"  低置信度(<0.4): {sum(c < 0.4 for c in confidence_scores)}")
+        
+        print(f"\n📈 预测类别分布:")
+        counts = df['Category'].value_counts()
+        for category, count in counts.items():
+            percentage = count / len(df) * 100
+            print(f"  {category}: {count} ({percentage:.1f}%)")
+        
+        print(f"\n🎯 模型性能:")
+        for name, score in cv_scores.items():
+            print(f"  {name}: {score:.4f}")
+        print(f"  最佳模型: {best_model_name} ({best_score:.4f})")
+        print(f"  特征数量: {X.shape[1]}")
+        
+    else:
+        print(f"❌ 保存失败!")
+        # 尝试其他位置
+        try:
+            df[['ID', 'Category']].to_csv("submission_final.csv", index=False)
+            print("✅ 已保存到 submission_final.csv")
+        except:
+            print("❌ 备份保存失败!")
+    
+    print("\n" + "=" * 60)
+    print("🎉 程序完成!")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    main()
